@@ -1,0 +1,109 @@
+name: Rustlings autograding
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: [README.md]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Keep the default token read-only. Only the publishing job may update gh-pages.
+permissions:
+  contents: read
+
+concurrency:
+  group: rustlings-score-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    name: Autograding
+    runs-on: ubuntu-latest
+    outputs:
+      points: ${{ steps.score.outputs.points }}
+    steps:
+      - name: Check out submission
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Run tests
+        run: cargo test --test cicv --verbose
+
+      - name: Calculate score
+        id: score
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          result_file=.github/result/check_result.json
+          score=$(jq -er '.statistics.total_succeeds' "$result_file")
+          total=$(jq -er '.statistics.total_exercations' "$result_file")
+
+          printf 'points=%s/%s\n' "$score" "$total" >>"$GITHUB_OUTPUT"
+          printf 'Points: %s/%s\n' "$score" "$total"
+          {
+            printf '### Rustlings score\n\n'
+            printf '`Points: %s/%s`\n' "$score" "$total"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  publish-score:
+    name: Publish score for the legacy leaderboard
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Update gh-pages score files
+        shell: bash
+        env:
+          POINTS: ${{ needs.build.outputs.points }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$POINTS" =~ ^[0-9]+/[0-9]+$ ]]; then
+            printf 'Unexpected score format: %s\n' "$POINTS" >&2
+            exit 1
+          fi
+
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git fetch --no-tags --depth=1 origin gh-pages
+            git checkout --detach FETCH_HEAD
+          else
+            git checkout --orphan gh-pages
+            git rm -rf --ignore-unmatch .
+          fi
+
+          if [[ ! -f latest.json ]]; then
+            printf '{}\n' >latest.json
+          fi
+          jq -e 'type == "object"' latest.json >/dev/null
+
+          timestamp=$(date '+%Y_%m_%d_%H_%M_%S')
+          score_file="${timestamp}.txt"
+          printf 'Points: %s\n' "$POINTS" >"$score_file"
+
+          jq --arg file "$score_file" \
+            '.main = $file' latest.json >latest.json.tmp
+          mv latest.json.tmp latest.json
+
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add latest.json "$score_file"
+
+          if git diff --cached --quiet; then
+            echo 'Score files are already up to date.'
+            exit 0
+          fi
+
+          git commit -m "score: update main to ${POINTS}"
+          git push origin HEAD:gh-pages
